@@ -1,0 +1,126 @@
+name: Build yq Android
+
+on:
+  push:
+    branches: [ master ]
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: set up go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '^1.20'
+      id: go
+
+    - uses: nttld/setup-ndk@v1
+      id: setup-ndk
+      with:
+        ndk-version: r25b
+        add-to-path: false
+        local-cache: false
+
+    - name: get dependencies
+      run: |
+        go get -v -t -d ./...
+        if [ -f Gopkg.toml ]; then
+            curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
+            dep ensure
+        fi
+
+    - name: check the build
+      shell: bash -l {0}
+      run: |
+        export PATH=${PATH}:`go env GOPATH`/bin
+        scripts/devtools.sh
+        make local
+
+    - name: Build Android
+      env:
+        ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+      run: |
+        mkdir -p bin
+        CC=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin
+        CGO_ENABLED=1 CC=${CC}/aarch64-linux-android33-clang GOARCH=arm64 GOOS=android go build -tags yq_toml -tags yq_xml -tags yq_json -ldflags "-s -w" -o bin/yq_android_arm64
+        CGO_ENABLED=1 CC=${CC}/armv7a-linux-androideabi33-clang GOARCH=arm GOARM=7 GOOS=android go build -tags yq_toml -tags yq_xml -tags yq_json -ldflags "-s -w" -o bin/yq_android_arm
+        # CGO_ENABLED=0 CC=${CC}/i686-linux-android33-clang GOARCH=386 GOOS=android go build -tags yq_toml -tags yq_xml -tags yq_json -ldflags "-s -w" -o bin/yq_android_386
+        # CGO_ENABLED=0 CC=${CC}/x86_64-linux-android33-clang GOARCH=amd64 GOOS=android go build -tags yq_toml -tags yq_xml -tags yq_json -ldflags "-s -w" -o bin/yq_android_amd64
+
+    - uses: actions/upload-artifact@v4
+      if: ${{  success() }}
+      with:
+        name: artifact
+        path: bin/
+
+  upload-prerelease:
+    permissions: write-all
+    if: ${{ github.ref_type=='branch' }}
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: artifact
+          path: bin/
+
+      - name: delete current release assets
+        uses: 8Mi-Tech/delete-release-assets-action@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: prerelease
+          deleteOnlyFromDrafts: false
+
+      - name: tag repo
+        uses: richardsimko/update-tag@v1.0.6
+        with:
+          tag_name: prerelease
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: upload prerelease
+        uses: softprops/action-gh-release@v1
+        if: ${{  success() }}
+        with:
+          tag_name: prerelease
+          files: |
+            bin/yq_*
+          prerelease: true
+          generate_release_notes: true
+
+  upload:
+    name: telegram upload release
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: donwload artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: artifact
+          path: bin
+
+      - name: upload to telegram
+        if: ${{  success() }}
+        env:
+          CHAT_ID: "-1002034198189"
+          MESSAGE_THREAD_ID: "218356"
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          if [ ! -z "${{ secrets.BOT_TOKEN }}" ]; then
+            export VERSION=$(git describe --tags)
+            export COMMIT=$(git log --oneline -n 10 --no-decorate | sed 's/^[0-9a-f]* //' | sed 's/^/— /')
+            FILE=$(find ./bin/yq_* -type f)
+            pip3 install telethon==1.31.1
+            python3 $GITHUB_WORKSPACE/.github/taamarinbot.py $FILE
+          fi
